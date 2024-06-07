@@ -1,0 +1,319 @@
+# ===----------------------------------------------------------------------=== #
+# Copyright (c) 2024, Modular Inc. All rights reserved.
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions:
+# https://llvm.org/LICENSE.txt
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ===----------------------------------------------------------------------=== #
+
+import sys
+from collections import List
+from pathlib import cwd, Path
+from utils.index import Index
+
+from max.engine import InferenceSession, Model
+from max.graph import Graph
+from max.graph.quantization import (
+    Float32Encoding,
+    QuantizationEncoding,
+    Q4_0Encoding,
+    Q4_KEncoding,
+    Q6_KEncoding,
+)
+from tensor import Tensor, TensorShape
+
+from .kv_cache import KVCache
+from ..llama3.metrics import Metrics
+from .model.llama import Llama2
+from .token_sampler.weighted_sampler import WeightedSampler
+from .tokenizer.bpe import BPETokenizer
+from ..tokenizer import AutoTokenizer, Tokenizer
+from ..weights.download import download_weights_to_cache
+from ..weights.gguf import GGUFFile
+from ..weights.llama2checkpoint import LlamaCFile
+from ..weights.loadable_model import LlamaHParams, LoadableModel
+
+
+@value
+struct Config:
+    """Configuration for token generation runtime options."""
+
+    var batch_size: Int
+    var max_tokens: Int
+    var model_path: Path
+    var custom_ops_paths: List[Path]
+    var tokenizer_path: Path
+    var enable_custom_rope_kernel: Bool
+    var prompt: String
+    var quantization_encoding: String
+    var temperature: Float32
+    var min_p: Float32
+
+    def __init__(
+        inout self,
+        /,
+        batch_size: Int = 1,
+        max_tokens: Int = 512,
+        model_path: Path = "",
+        custom_ops_paths: List[Path] = List[Path](),
+        tokenizer_path: Path = "",
+        enable_custom_rope_kernel: Bool = False,
+        prompt: String = "",
+        quantization_encoding: String = "q4_0",
+        temperature: Float32 = 0.5,
+        min_p: Float32 = 0.05,
+    ):
+        self.batch_size = batch_size
+        self.max_tokens = max_tokens
+        self.model_path = model_path
+        self.custom_ops_paths = custom_ops_paths
+        self.tokenizer_path = tokenizer_path
+        self.enable_custom_rope_kernel = enable_custom_rope_kernel
+        self.prompt = prompt
+        self.quantization_encoding = quantization_encoding
+        """Encoding for quantized model weights, such as Q4_0."""
+
+        """Token sampler parameters"""
+        self.temperature = temperature
+        self.min_p = min_p
+
+        self.parse_args()
+
+    def parse_args(inout self):
+        args = sys.argv()
+
+        def parse_argument_value(inout index: Int) -> StringRef:
+            if index + 1 >= len(args):
+                raise "missing value for parameter `" + str(args[index]) + "`"
+            result = args[index + 1]
+            index += 2
+            return result
+
+        # Skip the run_pipeline.mojo and llama2 arguments.
+        i = 2
+        while i < len(args):
+            if args[i] == "--temperature":
+                self.temperature = atof(parse_argument_value(i))
+            elif args[i] == "--min-p":
+                self.min_p = atof(parse_argument_value(i))
+            elif args[i] == "--max-tokens":
+                self.max_tokens = atol(parse_argument_value(i))
+            elif args[i] == "--model-path":
+                self.model_path = Path(parse_argument_value(i))
+            elif args[i] == "--custom-ops-path":
+                self.custom_ops_paths.append(Path(parse_argument_value(i)))
+            elif args[i] == "--tokenizer-path":
+                self.tokenizer_path = Path(parse_argument_value(i))
+            elif args[i] == "--enable-custom-rope-kernel":
+                self.enable_custom_rope_kernel = True
+                i += 1
+            elif args[i] == "--prompt":
+                self.prompt = parse_argument_value(i)
+            elif args[i] == "--quantization-encoding":
+                self.quantization_encoding = String(parse_argument_value(i))
+            else:
+                raise "unsupported CLI argument: " + String(args[i])
+
+        if self.prompt == "":
+            raise "--prompt is a required argument"
+        if self.enable_custom_rope_kernel and len(self.custom_ops_paths) == 0:
+            raise "--custom-ops-path argument is required when --enable-custom-rope-kernel is set"
+
+
+def execute(
+    session: InferenceSession,
+    model: Model,
+    tokens: Tensor[DType.int64],
+    inout kv_cache: KVCache,
+) -> Tensor[DType.float32]:
+    """Execute the model predicting one new token."""
+    input_map = session.new_tensor_map()
+    input_map.borrow("input0", tokens)
+    input_map.borrow("input1", kv_cache.keys_view())
+    input_map.borrow("input2", kv_cache.values_view())
+    results = model.execute(input_map)
+    kv_cache.update(
+        results.buffer[DType.float32]("output1"),
+        results.buffer[DType.float32]("output2"),
+    )
+    return results.get[DType.float32]("output0")
+
+
+def compile_graph(
+    graph: Graph, custom_ops_paths: List[Path] = List[Path]()
+) -> Model:
+    """Compiles a staged graph using the graph compiler."""
+    session = InferenceSession()
+
+    print("Compiling...")
+    return session.load(graph, custom_ops_paths=custom_ops_paths)
+
+
+def _generate_text_with_tokenizer[
+    tokenizer_type: Tokenizer
+](
+    inout tokenizer: tokenizer_type,
+    compiled_model: Model,
+    params: LlamaHParams,
+    config: Config,
+    inout metrics: Metrics,
+):
+    metrics.begin_timing_prompt()
+    prompt = tokenizer.encode(config.prompt, bos=String("\n<s>\n"))
+    metrics.set_tokens_in_prompt(prompt.size)
+    sampler = WeightedSampler(config.temperature, config.min_p)
+
+    tokens = Tensor[DType.int64](TensorShape(1, len(prompt)))
+    for i in range(len(prompt)):
+        tokens[Index(0, i)] = prompt[i]
+
+    print("Executing...")
+    print(tokenizer.decode(prompt), end="")
+
+    kv_cache = KVCache(params, config.max_tokens, config.batch_size)
+
+    # The first iteration caches the entire prompt and all subsequent
+    # iterations generate one token.
+    # Avoid overrunning the cache by setting the trip count accordingly.
+    metrics.begin_timing_generation()
+    for _ in range(prompt.size, config.max_tokens + 1):
+        logits = execute(
+            compiled_model._session, compiled_model, tokens, kv_cache
+        )
+        var token: SIMD[DType.int64, 1] = sampler.sample(logits).selected
+        tokens = Tensor(TensorShape(1, 1), token)
+        metrics.new_token()
+        print(tokenizer.decode(token), end="")
+    print()
+    metrics.end_timing()
+
+
+def generate_text(
+    compiled_model: Model,
+    params: LlamaHParams,
+    config: Config,
+    inout metrics: Metrics,
+):
+    """Generates text by applying the compiled model to the provided prompt."""
+
+    @parameter
+    def generate_with_mojo_tokenizer():
+        mojo_tokenizer = BPETokenizer.from_file(config.tokenizer_path)
+        _generate_text_with_tokenizer[BPETokenizer](
+            mojo_tokenizer,
+            compiled_model,
+            params,
+            config,
+            metrics,
+        )
+
+    if AutoTokenizer.is_available():
+        # Prefer the AutoTokenizer if it is available, for correctness.
+        try:
+            auto_tokenizer = AutoTokenizer("meta-llama/Llama-2-7b-hf")
+            _generate_text_with_tokenizer[AutoTokenizer](
+                auto_tokenizer,
+                compiled_model,
+                params,
+                config,
+                metrics,
+            )
+        except:
+            print(
+                "Unable to initialize AutoTokenizer, using Mojo tokenizer"
+                " instead."
+            )
+
+            # Fall back to the Mojo tokenizer if setting up the AutoTokenizer
+            # fails, for example due to lack of authentication.
+            generate_with_mojo_tokenizer()
+    else:
+        print(
+            "Hugging Face `transformers` not installed, using Mojo tokenizer"
+            " instead."
+        )
+        # Fall back to the Mojo tokenizer if `transformers` is not installed.
+        generate_with_mojo_tokenizer()
+
+
+def run[
+    model_type: LoadableModel, encoding: QuantizationEncoding
+](config: Config):
+    print("Building model...")
+    metrics = Metrics()
+    metrics.begin_timing_startup()
+
+    model = Llama2[model_type, encoding](
+        config.model_path,
+        enable_custom_rope_kernel=config.enable_custom_rope_kernel,
+    )
+    params = model.hyperparams()
+    graph = model.build_graph("llama_model")
+
+    compiled_model = compile_graph(graph, config.custom_ops_paths)
+    metrics.end_timing_startup()
+
+    generate_text(compiled_model, params, config, metrics)
+    print()
+    metrics.print()
+
+
+def run_outer[
+    run_fn: fn[model_type: LoadableModel, encoding: QuantizationEncoding] (
+        Config
+    ) raises -> object
+]():
+    config = Config()
+
+    cache_path = cwd().joinpath(".cache")
+    encoding = config.quantization_encoding.lower()
+    if encoding == "q4_0":
+        if len(str(config.model_path)) == 0:
+            # If no manual model path has been specified, download and cache
+            # default quantized weights.
+            config.tokenizer_path = cache_path.joinpath("tokenizer.bin")
+            config.model_path = cache_path.joinpath("llama-2-7b.Q4_0.gguf")
+            download_weights_to_cache(
+                cache_path,
+                "https://github.com/tairov/llama2.mojo/raw/master/tokenizer.bin",
+                "https://huggingface.co/TheBloke/Llama-2-7B-GGUF/resolve/main/llama-2-7b.Q4_0.gguf",
+            )
+        run_fn[GGUFFile, Q4_0Encoding](config)
+    elif encoding == "q4_k":
+        if len(str(config.model_path)) == 0:
+            config.tokenizer_path = cache_path.joinpath("tokenizer.bin")
+            config.model_path = cache_path.joinpath("llama-2-7b.Q4_K_M.gguf")
+            download_weights_to_cache(
+                cache_path,
+                "https://github.com/tairov/llama2.mojo/raw/master/tokenizer.bin",
+                "https://huggingface.co/TheBloke/Llama-2-7B-GGUF/resolve/main/llama-2-7b.Q4_K_M.gguf",
+            )
+        run_fn[GGUFFile, Q4_KEncoding](config)
+    elif encoding == "q6_k":
+        if len(str(config.model_path)) == 0:
+            config.tokenizer_path = cache_path.joinpath("tokenizer.bin")
+            config.model_path = cache_path.joinpath("llama-2-7b.Q6_K.gguf")
+            download_weights_to_cache(
+                cache_path,
+                "https://github.com/tairov/llama2.mojo/raw/master/tokenizer.bin",
+                "https://huggingface.co/TheBloke/Llama-2-7B-GGUF/resolve/main/llama-2-7b.Q6_K.gguf",
+            )
+        run_fn[GGUFFile, Q6_KEncoding](config)
+    elif encoding == "float32":
+        if config.model_path.suffix() == ".gguf":
+            run_fn[GGUFFile, Float32Encoding](config)
+        elif config.model_path.suffix() == ".bin":
+            run_fn[LlamaCFile, Float32Encoding](config)
+        else:
+            raise "invalid model path"
+    else:
+        raise 'Encoding "' + encoding + '" not yet supported'
+
+
+def llama2_run():
+    run_outer[run]()

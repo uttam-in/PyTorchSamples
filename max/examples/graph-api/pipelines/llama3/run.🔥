@@ -1,0 +1,261 @@
+# ===----------------------------------------------------------------------=== #
+# Copyright (c) 2024, Modular Inc. All rights reserved.
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions:
+# https://llvm.org/LICENSE.txt
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ===----------------------------------------------------------------------=== #
+
+import sys
+from collections import List, Optional
+from pathlib import cwd, Path
+from utils.index import Index
+
+from max.engine import InferenceSession, Model, TensorMap
+from max.graph import Graph
+from max.graph.quantization import (
+    Float32Encoding,
+    QuantizationEncoding,
+    Q4_0Encoding,
+    Q4_KEncoding,
+    Q6_KEncoding,
+)
+from tensor import Tensor, TensorShape, TensorSpec
+
+from .kv_cache import KVCache
+from .metrics import Metrics
+from .model.llama import Llama3
+from .tokenizer.tiktoken import TikTokenEncoder
+from .tokenizer.regex import set_locale_unicode
+from ..llama2.token_sampler.weighted_sampler import WeightedSampler
+from ..weights.download import download_weights_to_cache
+from ..weights.gguf import GGUFArray, GGUFFile
+from ..weights.loadable_model import LlamaHParams, LoadableModel
+
+
+@value
+struct Config:
+    """Configuration for token generation runtime options."""
+
+    var batch_size: Int
+    var max_tokens: Int
+    var model_path: Path
+    var custom_ops_paths: List[Path]
+    var tokenizer_path: Path
+    var prompt: String
+    var quantization_encoding: String
+    var use_gpu: Bool
+    var temperature: Float32
+    var min_p: Float32
+
+    def __init__(
+        inout self,
+        /,
+        batch_size: Int = 1,
+        max_tokens: Int = 512,
+        model_path: Path = "",
+        custom_ops_paths: List[Path] = List[Path](),
+        tokenizer_path: Path = "",
+        prompt: String = "",
+        quantization_encoding: String = "q4_k",
+        use_gpu: Bool = False,
+        temperature: Float32 = 0.5,
+        min_p: Float32 = 0.05,
+    ):
+        self.batch_size = batch_size
+        self.max_tokens = max_tokens
+        self.model_path = model_path
+        self.custom_ops_paths = custom_ops_paths
+        self.tokenizer_path = tokenizer_path
+        self.prompt = prompt
+        self.quantization_encoding = quantization_encoding
+        """Encoding for quantized model weights: Q4_0, Q4_K, or Q6_K."""
+        self.use_gpu = use_gpu
+
+        self.temperature = temperature
+        self.min_p = min_p
+
+        self.parse_args()
+
+    def parse_args(inout self):
+        args = sys.argv()
+
+        def parse_argument_value(inout index: Int) -> StringRef:
+            if index + 1 >= len(args):
+                raise "missing value for parameter `" + str(args[index]) + "`"
+            result = args[index + 1]
+            index += 2
+            return result
+
+        # Skip the run_pipeline.mojo and llama3 arguments.
+        i = 2
+        while i < len(args):
+            if args[i] == "--temperature":
+                self.temperature = atof(parse_argument_value(i))
+            elif args[i] == "--min-p":
+                self.min_p = atof(parse_argument_value(i))
+            elif args[i] == "--max-tokens":
+                self.max_tokens = atol(parse_argument_value(i))
+            elif args[i] == "--model-path":
+                # If a manual model path has been specified, don't use one of
+                # the downloadable pretrained models.
+                self.model_path = Path(parse_argument_value(i))
+            elif args[i] == "--custom-ops-path":
+                self.custom_ops_paths.append(Path(parse_argument_value(i)))
+            elif args[i] == "--tokenizer-path":
+                self.tokenizer_path = Path(parse_argument_value(i))
+            elif args[i] == "--prompt":
+                self.prompt = parse_argument_value(i)
+            elif args[i] == "--quantization-encoding":
+                self.quantization_encoding = String(parse_argument_value(i))
+            else:
+                raise "unsupported CLI argument: " + String(args[i])
+
+        if self.prompt == "":
+            raise "--prompt is a required argument"
+
+
+def execute(
+    session: InferenceSession,
+    model: Model,
+    tokens: Tensor[DType.int64],
+    inout kv_cache: KVCache,
+) -> Tensor[DType.float32]:
+    """Execute the model predicting one new token."""
+    input_map = model._session.new_tensor_map()
+    input_map.borrow("input0", tokens)
+    input_map.borrow("input1", kv_cache.keys_view())
+    input_map.borrow("input2", kv_cache.values_view())
+    results = model.execute(input_map)
+    kv_cache.update(
+        results.buffer[DType.float32]("output1"),
+        results.buffer[DType.float32]("output2"),
+    )
+    return results.get[DType.float32]("output0")
+
+
+def compile_graph(
+    graph: Graph, custom_ops_paths: List[Path] = List[Path]()
+) -> Model:
+    """Compiles a staged graph using the graph compiler."""
+    session = InferenceSession()
+
+    print("Compiling...")
+    return session.load(graph, custom_ops_paths=custom_ops_paths)
+
+
+def generate_text(
+    tokenizer: TikTokenEncoder,
+    compiled_model: Model,
+    params: LlamaHParams,
+    config: Config,
+    inout metrics: Metrics,
+):
+    """Generates text by applying the compiled model to the provided prompt."""
+
+    metrics.begin_timing_prompt()
+    prompt = tokenizer.encode(config.prompt)
+    sampler = WeightedSampler(config.temperature, config.min_p)
+    metrics.set_tokens_in_prompt(prompt.size)
+
+    tokens = Tensor[DType.int64](TensorShape(1, len(prompt)))
+    for i in range(len(prompt)):
+        tokens[Index(0, i)] = prompt[i].id
+
+    print("Executing...")
+    for token in prompt:
+        print(tokenizer.decode(token[].id).token, end="")
+
+    kv_cache = KVCache(params, config.max_tokens, config.batch_size)
+
+    # The first iteration caches the entire prompt and all subsequent
+    # iterations generate one token.
+    # Avoid overrunning the cache by setting the trip count accordingly.
+    metrics.begin_timing_generation()
+    for _ in range(prompt.size, config.max_tokens + 1):
+        logits = execute(
+            compiled_model._session, compiled_model, tokens, kv_cache
+        )
+        token = sampler.sample(logits).selected
+        tokens = Tensor(TensorShape(1, 1), Int64(token))
+        metrics.new_token()
+        print(tokenizer.decode(token).token, end="")
+    print()
+    metrics.end_timing()
+
+
+def run[encoding: QuantizationEncoding](config: Config):
+    metrics = Metrics()
+    metrics.begin_timing_startup()
+    model = Llama3[encoding](config.model_path)
+    params = model.hyperparams()
+
+    print("Loading tokenizer...")
+    tokenizer = TikTokenEncoder.cl100k_base_llama3(
+        model.model["tokenizer.ggml.tokens"]._value.unsafe_get[GGUFArray]()[]
+    )
+
+    print("Building model...")
+    graph = model.build_graph("llama_model")
+
+    compiled_model = compile_graph(graph, config.custom_ops_paths)
+    metrics.end_timing_startup()
+
+    generate_text(tokenizer, compiled_model, params, config, metrics)
+    print()
+    metrics.print()
+
+
+def cached_weights(url: String) -> Path:
+    cache_path = cwd().joinpath(".cache")
+    download_weights_to_cache(cache_path, url)
+    return cache_path / url.split("/")[-1]
+
+
+alias llama_main = def (Config)
+
+
+@value
+struct WeightMetadata:
+    var main: llama_main
+    var url: String
+
+    @staticmethod
+    def _ALL() -> Dict[String, WeightMetadata]:
+        all_metadata = Dict[String, WeightMetadata]()
+        all_metadata[Q4_0Encoding.id()] = WeightMetadata(
+            run[Q4_0Encoding],
+            "https://huggingface.co/QuantFactory/Meta-Llama-3-8B-GGUF/resolve/main/Meta-Llama-3-8B.Q4_0.gguf",
+        )
+        all_metadata[Q4_KEncoding.id()] = WeightMetadata(
+            run[Q4_KEncoding],
+            "https://huggingface.co/bartowski/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-Q4_K_M.gguf",
+        )
+        all_metadata[Q6_KEncoding.id()] = WeightMetadata(
+            run[Q6_KEncoding],
+            "https://huggingface.co/bartowski/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-Q6_K.gguf",
+        )
+        return all_metadata^
+
+    @staticmethod
+    def from_encoding(encoding_id: String) -> Self:
+        return Self._ALL()[encoding_id]
+
+
+def llama3_run():
+    config = Config()
+    set_locale_unicode()
+
+    encoding = config.quantization_encoding.lower()
+    weight_metadata = WeightMetadata.from_encoding(encoding)
+    if not str(config.model_path):
+        # TODO(MOCO-794): assign directly
+        var model_path: String = str(cached_weights(weight_metadata.url))
+        config = Config()
+        config.model_path = model_path
+    weight_metadata.main(config)
