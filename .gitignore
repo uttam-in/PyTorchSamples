@@ -1,1 +1,4 @@
 *.torchscript
+roop
+*.pth
+*.zip
